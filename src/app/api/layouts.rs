@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
+    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutApplyPresetParams,
+    LayoutDescription, LayoutExportParams, LayoutNode, LayoutPane, LayoutPreset,
+    LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
@@ -246,6 +247,56 @@ impl App {
         };
         self.emit_layout_updated_event(ws_idx, tab_idx);
         encode_success(id, ResponseResult::LayoutSplitRatioSet { layout })
+    }
+
+    pub(super) fn handle_layout_apply_preset(
+        &mut self,
+        id: String,
+        params: LayoutApplyPresetParams,
+    ) -> String {
+        if params.workspace_id.is_some() && params.tab_id.is_some() {
+            return encode_error(
+                id,
+                "invalid_target",
+                "use either tab_id or workspace_id, not both",
+            );
+        }
+        let target = LayoutExportParams {
+            tab_id: params.tab_id.clone(),
+            pane_id: None,
+        };
+        let Some((ws_idx, tab_idx)) = self.resolve_layout_export_target(&target) else {
+            return encode_error(id, "layout_not_found", "layout target not found");
+        };
+
+        let preset = match params.preset {
+            LayoutPreset::EvenHorizontal => crate::layout::LayoutPreset::EvenHorizontal,
+            LayoutPreset::EvenVertical => crate::layout::LayoutPreset::EvenVertical,
+            LayoutPreset::MainHorizontal => crate::layout::LayoutPreset::MainHorizontal,
+            LayoutPreset::MainVertical => crate::layout::LayoutPreset::MainVertical,
+            LayoutPreset::Tiled => crate::layout::LayoutPreset::Tiled,
+        };
+
+        let changed = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|ws| ws.tabs.get_mut(tab_idx))
+            .is_some_and(|tab| tab.layout.apply_layout_preset(preset));
+
+        if !changed {
+            return encode_error(
+                id,
+                "layout_unchanged",
+                "layout preset did not change the layout",
+            );
+        }
+
+        self.schedule_session_save();
+        let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
+            return encode_error(id, "layout_not_found", "layout unavailable");
+        };
+        encode_success(id, ResponseResult::LayoutApplyPreset { layout })
     }
 
     fn resolve_layout_export_target(&self, params: &LayoutExportParams) -> Option<(usize, usize)> {
@@ -661,6 +712,60 @@ mod tests {
         };
         assert_eq!(pane.label.as_deref(), Some("tests"));
         assert_eq!(pane.pane_id, Some(app.public_pane_id(0, right).unwrap()));
+    }
+
+    #[test]
+    fn layout_apply_preset_restructures_active_tab() {
+        let mut app = app_with_workspace();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let _right = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let _bottom = app.state.workspaces[0].test_split(Direction::Vertical);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[0].layout.focus_pane(root);
+
+        let before_ids = app.state.workspaces[0].tabs[0].layout.pane_ids();
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+
+        let response = app.handle_layout_apply_preset(
+            "req".into(),
+            LayoutApplyPresetParams {
+                workspace_id: None,
+                tab_id: Some(tab_id),
+                preset: LayoutPreset::EvenVertical,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::LayoutApplyPreset { layout } = success.result else {
+            panic!("expected layout apply preset response");
+        };
+        assert_eq!(layout.workspace_id, app.public_workspace_id(0));
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids(),
+            before_ids
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.last_layout_preset(),
+            Some(crate::layout::LayoutPreset::EvenVertical)
+        );
+        // All splits should be horizontal for an even-vertical layout.
+        let all_horizontal = matches!(&layout.root, LayoutNode::Split { direction, .. } if *direction == SplitDirection::Right);
+        assert!(all_horizontal);
+    }
+
+    #[test]
+    fn layout_apply_preset_rejects_unknown_tab() {
+        let mut app = app_with_workspace();
+        let response = app.handle_layout_apply_preset(
+            "req".into(),
+            LayoutApplyPresetParams {
+                workspace_id: None,
+                tab_id: Some("tab-does-not-exist".into()),
+                preset: LayoutPreset::Tiled,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "layout_not_found");
     }
 
     #[test]

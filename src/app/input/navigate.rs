@@ -382,6 +382,14 @@ impl App {
                 leave_navigate_mode(&mut self.state);
             }
             NavigateAction::EnterResizeMode => self.state.mode = Mode::Resize,
+            NavigateAction::NextLayout => {
+                self.apply_next_layout_preset_via_api(false);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::PreviousLayout => {
+                self.apply_next_layout_preset_via_api(true);
+                leave_navigate_mode(&mut self.state);
+            }
             NavigateAction::ToggleSidebar => {
                 self.state.sidebar_collapsed = !self.state.sidebar_collapsed;
                 leave_navigate_mode(&mut self.state);
@@ -616,6 +624,65 @@ impl App {
             ids[(pos + 1) % ids.len()]
         };
         self.focus_pane_internal_via_api(ws_idx, target);
+    }
+
+    pub(crate) fn apply_next_layout_preset_via_api(&mut self, reverse: bool) {
+        let Some((ws_idx, tab_idx)) = self.active_tab_target() else {
+            return;
+        };
+        let tab = match self.state.workspaces[ws_idx].tabs.get(tab_idx) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let current = tab.layout.last_layout_preset();
+        let preset = if reverse {
+            current.map(|p| p.previous()).unwrap_or_else(|| {
+                // Start from the last preset in the cycle so the first press
+                // wraps around to it.
+                let all = crate::layout::LayoutPreset::all();
+                all[all.len() - 1]
+            })
+        } else {
+            current
+                .map(|p| p.next())
+                .unwrap_or(crate::layout::LayoutPreset::all()[0])
+        };
+        let tab_id = match self.public_tab_id(ws_idx, tab_idx) {
+            Some(id) => id,
+            None => return,
+        };
+        self.dispatch_runtime_mutation(
+            "tui.layout.apply_preset",
+            crate::api::schema::Method::LayoutApplyPreset(
+                crate::api::schema::LayoutApplyPresetParams {
+                    workspace_id: None,
+                    tab_id: Some(tab_id),
+                    preset: match preset {
+                        crate::layout::LayoutPreset::EvenHorizontal => {
+                            crate::api::schema::LayoutPreset::EvenHorizontal
+                        }
+                        crate::layout::LayoutPreset::EvenVertical => {
+                            crate::api::schema::LayoutPreset::EvenVertical
+                        }
+                        crate::layout::LayoutPreset::MainHorizontal => {
+                            crate::api::schema::LayoutPreset::MainHorizontal
+                        }
+                        crate::layout::LayoutPreset::MainVertical => {
+                            crate::api::schema::LayoutPreset::MainVertical
+                        }
+                        crate::layout::LayoutPreset::Tiled => {
+                            crate::api::schema::LayoutPreset::Tiled
+                        }
+                    },
+                },
+            ),
+        );
+    }
+
+    fn active_tab_target(&self) -> Option<(usize, usize)> {
+        let ws_idx = self.state.active?;
+        let tab_idx = self.state.workspaces.get(ws_idx)?.active_tab_index();
+        Some((ws_idx, tab_idx))
     }
 
     pub(crate) fn last_pane_via_api(&mut self) {
@@ -1313,6 +1380,8 @@ pub(crate) enum NavigateAction {
     CopyMode,
     Zoom,
     EnterResizeMode,
+    NextLayout,
+    PreviousLayout,
     ToggleSidebar,
     CyclePaneNext,
     CyclePanePrevious,
@@ -1449,6 +1518,8 @@ fn non_indexed_action_for_key(
         (&kb.close_pane, NavigateAction::ClosePane),
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
+        (&kb.next_layout, NavigateAction::NextLayout),
+        (&kb.previous_layout, NavigateAction::PreviousLayout),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
@@ -1713,6 +1784,10 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
+        NavigateAction::NextLayout | NavigateAction::PreviousLayout => {
+            // Layout cycling is driven through the runtime API in normal
+            // operation; it is not exercised through this test helper.
+        }
     }
 
     finish_action_context(state, context, previous_mode);

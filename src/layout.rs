@@ -69,6 +69,46 @@ pub enum NavDirection {
     Down,
 }
 
+/// Preset pane arrangements, matching the layouts familiar from tmux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+impl LayoutPreset {
+    /// All presets in the order cycled by `next`.
+    pub fn all() -> &'static [LayoutPreset] {
+        &[
+            LayoutPreset::EvenHorizontal,
+            LayoutPreset::EvenVertical,
+            LayoutPreset::MainHorizontal,
+            LayoutPreset::MainVertical,
+            LayoutPreset::Tiled,
+        ]
+    }
+
+    /// Preset that follows this one in the cycle.
+    pub fn next(self) -> LayoutPreset {
+        let all = Self::all();
+        let pos = all.iter().position(|p| *p == self).unwrap_or(0);
+        all[(pos + 1) % all.len()]
+    }
+
+    /// Preset that precedes this one in the cycle.
+    pub fn previous(self) -> LayoutPreset {
+        let all = Self::all();
+        let pos = all.iter().position(|p| *p == self).unwrap_or(0);
+        all[(pos + all.len() - 1) % all.len()]
+    }
+}
+
+const MAIN_PANE_RATIO: f32 = 0.6;
+const EVEN_SPLIT_RATIO: f32 = 0.5;
+
 /// A node in the BSP tree. Public for serialization.
 pub enum Node {
     Pane(PaneId),
@@ -84,6 +124,8 @@ pub enum Node {
 pub struct TileLayout {
     root: Node,
     focus: PaneId,
+    /// The last layout preset applied to this tab, used for cycling.
+    last_preset: Option<LayoutPreset>,
 }
 
 impl TileLayout {
@@ -95,9 +137,15 @@ impl TileLayout {
             Self {
                 root: Node::Pane(root_id),
                 focus: root_id,
+                last_preset: None,
             },
             root_id,
         )
+    }
+
+    /// The last layout preset applied to this tab, if any.
+    pub fn last_layout_preset(&self) -> Option<LayoutPreset> {
+        self.last_preset
     }
 
     pub fn focused(&self) -> PaneId {
@@ -262,6 +310,45 @@ impl TileLayout {
         ids
     }
 
+    /// Rebuild the layout tree into one of the preset arrangements.
+    /// Panes keep their identities; only the split structure changes.
+    /// Returns true when the layout was changed.
+    pub fn apply_layout_preset(&mut self, preset: LayoutPreset) -> bool {
+        let ids = self.pane_ids();
+        if ids.len() < 2 {
+            return false;
+        }
+
+        let focus_pos = ids.iter().position(|id| *id == self.focus).unwrap_or(0);
+
+        self.root = match preset {
+            LayoutPreset::EvenHorizontal => build_even_tree(&ids, Direction::Vertical),
+            LayoutPreset::EvenVertical => build_even_tree(&ids, Direction::Horizontal),
+            LayoutPreset::MainHorizontal => {
+                let ordered = main_order(&ids, focus_pos);
+                build_main_tree(
+                    &ordered,
+                    Direction::Vertical,
+                    Direction::Horizontal,
+                    MAIN_PANE_RATIO,
+                )
+            }
+            LayoutPreset::MainVertical => {
+                let ordered = main_order(&ids, focus_pos);
+                build_main_tree(
+                    &ordered,
+                    Direction::Horizontal,
+                    Direction::Vertical,
+                    MAIN_PANE_RATIO,
+                )
+            }
+            LayoutPreset::Tiled => build_tiled_tree(&ids),
+        };
+
+        self.last_preset = Some(preset);
+        true
+    }
+
     /// Access the tree root for serialization.
     pub fn root(&self) -> &Node {
         &self.root
@@ -270,7 +357,11 @@ impl TileLayout {
     /// Reconstruct a layout from a saved tree.
     /// Reconstruct a layout from a saved tree.
     pub fn from_saved(root: Node, focus: PaneId) -> Self {
-        Self { root, focus }
+        Self {
+            root,
+            focus,
+            last_preset: None,
+        }
     }
 }
 
@@ -513,6 +604,99 @@ fn swap_pane_ids(node: &mut Node, first: PaneId, second: PaneId) {
         } => {
             swap_pane_ids(first_child, first, second);
             swap_pane_ids(second_child, first, second);
+        }
+    }
+}
+
+/// Reorder ids so the pane at `main_idx` comes first, preserving the
+/// relative order of the remaining panes.
+fn main_order(ids: &[PaneId], main_idx: usize) -> Vec<PaneId> {
+    let mut ordered = Vec::with_capacity(ids.len());
+    ordered.push(ids[main_idx]);
+    ordered.extend(
+        ids.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != main_idx)
+            .map(|(_, id)| *id),
+    );
+    ordered
+}
+
+/// Build a tree where every split uses the same direction and ratio.
+fn build_even_tree(ids: &[PaneId], direction: Direction) -> Node {
+    match ids.len() {
+        0 => unreachable!("apply_layout_preset guards against < 2 panes"),
+        1 => Node::Pane(ids[0]),
+        2 => Node::Split {
+            direction,
+            ratio: EVEN_SPLIT_RATIO,
+            first: Box::new(Node::Pane(ids[0])),
+            second: Box::new(Node::Pane(ids[1])),
+        },
+        _ => {
+            let mid = ids.len() / 2;
+            Node::Split {
+                direction,
+                ratio: EVEN_SPLIT_RATIO,
+                first: Box::new(build_even_tree(&ids[..mid], direction)),
+                second: Box::new(build_even_tree(&ids[mid..], direction)),
+            }
+        }
+    }
+}
+
+/// Build a main-* layout: the first id gets `main_ratio` of the root split,
+/// the remaining ids share the rest using `rest_direction`.
+fn build_main_tree(
+    ids: &[PaneId],
+    main_direction: Direction,
+    rest_direction: Direction,
+    main_ratio: f32,
+) -> Node {
+    match ids.len() {
+        0 => unreachable!("apply_layout_preset guards against < 2 panes"),
+        1 => Node::Pane(ids[0]),
+        2 => Node::Split {
+            direction: main_direction,
+            ratio: main_ratio,
+            first: Box::new(Node::Pane(ids[0])),
+            second: Box::new(Node::Pane(ids[1])),
+        },
+        _ => Node::Split {
+            direction: main_direction,
+            ratio: main_ratio,
+            first: Box::new(Node::Pane(ids[0])),
+            second: Box::new(build_even_tree(&ids[1..], rest_direction)),
+        },
+    }
+}
+
+/// Build a roughly square tiled layout by alternating split directions.
+fn build_tiled_tree(ids: &[PaneId]) -> Node {
+    match ids.len() {
+        0 => unreachable!("apply_layout_preset guards against < 2 panes"),
+        1 => Node::Pane(ids[0]),
+        2 => Node::Split {
+            direction: Direction::Horizontal,
+            ratio: EVEN_SPLIT_RATIO,
+            first: Box::new(Node::Pane(ids[0])),
+            second: Box::new(Node::Pane(ids[1])),
+        },
+        _ => {
+            let mid = ids.len() / 2;
+            // Alternate directions so the tree forms a grid rather than a
+            // single long strip.
+            let direction = if ids.len().is_power_of_two() {
+                Direction::Horizontal
+            } else {
+                Direction::Vertical
+            };
+            Node::Split {
+                direction,
+                ratio: EVEN_SPLIT_RATIO,
+                first: Box::new(build_tiled_tree(&ids[..mid])),
+                second: Box::new(build_tiled_tree(&ids[mid..])),
+            }
         }
     }
 }
@@ -953,5 +1137,102 @@ mod tests {
             find_in_direction(&focused, NavDirection::Left, &panes),
             Some(pane(3))
         );
+    }
+
+    #[test]
+    fn apply_layout_preset_preserves_pane_ids_and_focus() {
+        let mut layout = sample_layout();
+        let before_ids = layout.pane_ids();
+        let before_focus = layout.focused();
+
+        assert!(layout.apply_layout_preset(LayoutPreset::EvenHorizontal));
+
+        assert_eq!(layout.pane_ids(), before_ids);
+        assert_eq!(layout.focused(), before_focus);
+        assert_eq!(
+            layout.last_layout_preset(),
+            Some(LayoutPreset::EvenHorizontal)
+        );
+    }
+
+    #[test]
+    fn apply_layout_preset_is_noop_for_single_pane() {
+        let (mut layout, _root) = TileLayout::new();
+
+        assert!(!layout.apply_layout_preset(LayoutPreset::Tiled));
+        assert_eq!(layout.pane_count(), 1);
+        assert_eq!(layout.last_layout_preset(), None);
+    }
+
+    #[test]
+    fn even_horizontal_uses_vertical_splits() {
+        let mut layout = sample_layout();
+        layout.apply_layout_preset(LayoutPreset::EvenHorizontal);
+
+        for (direction, _) in split_snapshot(&layout) {
+            assert_eq!(direction, Direction::Vertical);
+        }
+    }
+
+    #[test]
+    fn even_vertical_uses_horizontal_splits() {
+        let mut layout = sample_layout();
+        layout.apply_layout_preset(LayoutPreset::EvenVertical);
+
+        for (direction, _) in split_snapshot(&layout) {
+            assert_eq!(direction, Direction::Horizontal);
+        }
+    }
+
+    #[test]
+    fn main_horizontal_puts_focused_pane_at_top() {
+        let mut layout = sample_layout();
+        let focus = layout.focused();
+        layout.apply_layout_preset(LayoutPreset::MainHorizontal);
+
+        let root_split = first_split(&layout);
+        assert_eq!(root_split.0, Direction::Vertical);
+        assert!((root_split.1 - MAIN_PANE_RATIO).abs() < f32::EPSILON);
+
+        let info = pane_rect_info(&layout, focus);
+        assert_eq!(info.rect.y, 0);
+    }
+
+    #[test]
+    fn main_vertical_puts_focused_pane_at_left() {
+        let mut layout = sample_layout();
+        let focus = layout.focused();
+        layout.apply_layout_preset(LayoutPreset::MainVertical);
+
+        let root_split = first_split(&layout);
+        assert_eq!(root_split.0, Direction::Horizontal);
+        assert!((root_split.1 - MAIN_PANE_RATIO).abs() < f32::EPSILON);
+
+        let info = pane_rect_info(&layout, focus);
+        assert_eq!(info.rect.x, 0);
+    }
+
+    #[test]
+    fn layout_preset_cycles_in_order() {
+        let all = LayoutPreset::all();
+        for i in 0..all.len() {
+            let next = all[i].next();
+            assert_eq!(next, all[(i + 1) % all.len()]);
+            let prev = all[i].previous();
+            assert_eq!(prev, all[(i + all.len() - 1) % all.len()]);
+        }
+    }
+
+    fn first_split(layout: &TileLayout) -> (Direction, f32) {
+        split_snapshot(layout)[0]
+    }
+
+    #[allow(dead_code)]
+    fn pane_rect_info(layout: &TileLayout, id: PaneId) -> PaneInfo {
+        layout
+            .panes(Rect::new(0, 0, 100, 40))
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap()
     }
 }
